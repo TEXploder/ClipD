@@ -1,0 +1,25 @@
+PyInstaller is licensed under the GNU General Public License version 2 (GPLv2) with a specific
+exception that allows you to bundle it with your own code without the resulting executable falling
+under the GPL. The relevant text is reproduced below.
+
+------------------------------------------------------------------------------
+PyInstaller Bootloader Exception
+------------------------------------------------------------------------------
+
+The PyInstaller project includes a bootloader that is linked with your application.
+The bootloader sources are licensed under GPLv2 or any later version with the following
+special exception:
+
+    PyInstaller Exception
+
+    In addition to the permissions in the GNU General Public License, the authors give
+    you unlimited permission to link or embed compiled forms of the bootloader with
+    other works, and to distribute those works. You must comply with the GNU General
+    Public License in all respects for all of the code used other than the bootloader.
+    If you modify this exception, you must also change the name of the bootloader.
+
+Accordingly, you may distribute the output of PyInstaller without your application being
+subject to the terms of the GPLv2, provided you adhere to the above exception.
+
+For the complete PyInstaller license text, consult:
+<https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt>
