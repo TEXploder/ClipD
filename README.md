@@ -67,7 +67,7 @@ Für eine echte statische Link-Variante (ohne Ersatzmöglichkeit) benötigst du 
 
 ## Credits
 
-- Built with ❤️ auf Windows 11.
+- Built with ❤️ by TEXploder.
 - PySide6, Qt, Cython, Nuitka, PyInstaller.
 - Grafiken: `logo.ico`, `logo.png` (eigenes Branding einfügen).
 
