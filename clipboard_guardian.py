@@ -1358,26 +1358,6 @@ class HistoryDelegate(QtWidgets.QStyledItemDelegate):
                 return True
         return super().editorEvent(event, model, option, index)
 
-    def _text_height(self, text: str, font: QtGui.QFont, width: int) -> float:
-        if width <= 0:
-            return QtGui.QFontMetricsF(font).height()
-        layout = QtGui.QTextLayout(text or " ", font)
-        option = QtGui.QTextOption()
-        option.setWrapMode(QtGui.QTextOption.WordWrap)
-        layout.setTextOption(option)
-        layout.beginLayout()
-        total_height = 0.0
-        while True:
-            line = layout.createLine()
-            if not line.isValid():
-                break
-            line.setLineWidth(width)
-            total_height += line.height()
-        layout.endLayout()
-        if total_height == 0.0:
-            total_height = QtGui.QFontMetricsF(font).height()
-        return total_height
-
     def _star_rect(self, rect: QtCore.QRect) -> QtCore.QRect:
         return QtCore.QRect(rect.right() - 34, rect.top() + 10, 22, 22)
 
@@ -1453,6 +1433,20 @@ class HistoryDelegate(QtWidgets.QStyledItemDelegate):
         }
         painter.drawText(rect, QtCore.Qt.AlignCenter, icons.get(entry.format, "TXT"))
         painter.restore()
+
+    def _text_height(self, text: str, font: QtGui.QFont, width: int) -> float:
+        if width <= 0:
+            width = 160
+        doc = QtGui.QTextDocument()
+        doc.setDefaultFont(font)
+        doc.setPlainText(text or "")
+        doc.setTextWidth(float(width))
+        height = doc.size().height()
+        if height <= 0:
+            metrics = QtGui.QFontMetrics(font)
+            return float(metrics.lineSpacing())
+        return height
+
     def _preview_text(self, entry: ClipboardItem) -> str:
         if entry.format == "image":
             return "Bildvorschau"
