@@ -1,0 +1,28 @@
+ClipD – Changelog
+
+Unreleased
+-----------------
+Added
+- QR-Code pro Eintrag: Kontextmenü „QR-Code anzeigen“ und Button im Verlauf.
+- QR-Dialog: Anzeige in separatem Fenster, PNG-Export via „Speichern…“.
+- Globaler Hotkey zum QR-Erstellen (Standard: Alt+Shift+Q).
+- Einstellungen: Hotkey für „QR‑Code anzeigen“ frei konfigurierbar.
+- Bearbeiten von Einträgen: Kontextmenü „Bearbeiten…“ mit Editor-Dialog.
+- Smooth Scrolling: Sanftes, animiertes Scrollen im Verlauf.
+
+Changed
+- Auswahl-Stil im Verlauf: Rahmen mit Farbverlauf (Accent-Start → Accent-Ende)
+  und stark abgedunkelte, verlaufsbasierte Füllung – angelehnt an den Verlauf-Header.
+
+Packaging/Build
+- PyInstaller/Cython: Hidden-Imports für qrcode und PIL ergänzt, damit die
+  generierte EXE nicht mehr mit „ModuleNotFoundError: qrcode“ fehlschlägt.
+  Anpassungen:
+  - hook-clipd_core.py: qrcode, qrcode.image, qrcode.image.pil, PIL, PIL.Image,
+    PIL.PngImagePlugin hinzugefügt.
+  - ClipD.spec: gleiche Hidden-Imports ergänzt.
+
+Hinweise
+- QR-Codes werden aus einer Textrepräsentation des Eintrags erzeugt. Für Bilder
+  wird, wenn vorhanden, der Text verwendet; Tabellen/HTML werden als Text
+  (Plaintext/CSV) umgewandelt.

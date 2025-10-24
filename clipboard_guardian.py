@@ -8,6 +8,7 @@ import string
 import sys
 import time
 from dataclasses import dataclass, asdict, field
+from io import BytesIO
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -16,6 +17,7 @@ import ctypes.wintypes as wintypes
 import winreg
 
 from PySide6 import QtCore, QtGui, QtWidgets
+import qrcode
 from cryptography.fernet import Fernet
 
 
@@ -24,7 +26,7 @@ APP_DISPLAY_NAME = "ClipD"
 HISTORY_FILE_NAME = "history.bin"
 KEY_FILE_NAME = "key.bin"
 SETTINGS_FILE_NAME = "settings.json"
-MAX_HISTORY_ITEMS = 50
+MAX_HISTORY_ITEMS = 200
 
 OVERLAY_THEMES = ("classic", "glass", "minimal")
 
@@ -236,6 +238,7 @@ class AppSettings:
     hotkey_next: str = "Ctrl+Alt+Down"
     hotkey_prev: str = "Ctrl+Alt+Up"
     hotkey_show_history: str = "Ctrl+Alt+V"
+    hotkey_qr: str = "Alt+Shift+Q"
     show_preview_overlay: bool = True
     capture_protection_enabled: bool = True
     theme_mode: str = "dark"
@@ -304,6 +307,7 @@ class AppSettings:
             hotkey_next=self.hotkey_next or "Ctrl+Alt+Down",
             hotkey_prev=self.hotkey_prev or "Ctrl+Alt+Up",
             hotkey_show_history=self.hotkey_show_history or "Ctrl+Alt+V",
+            hotkey_qr=self.hotkey_qr or "Alt+Shift+Q",
             show_preview_overlay=preview_value,
             capture_protection_enabled=capture_value,
             theme_mode=theme_value,
@@ -506,6 +510,25 @@ class ClipboardHistory(QtCore.QObject):
         self._persist()
         self.historyUpdated.emit(self.all_items())
         self.selectionChanged.emit(None)
+
+    def edit_entry(self, entry: ClipboardItem, new_content: str) -> None:
+        """Replace entry content and convert it to plain text.
+
+        Keeps the item's position and pinned state; drops non-text payloads.
+        """
+        if entry not in self._history:
+            return
+        entry.content = new_content or ""
+        entry.format = "text"
+        entry.html = None
+        entry.image_data = None
+        entry.urls = []
+        entry.files = []
+        entry.rtf_data = None
+        entry.csv_data = None
+        self._persist()
+        self.historyUpdated.emit(self.all_items())
+        self.selectionChanged.emit(self.current_item())
 
     def push_to_clipboard(self, item: ClipboardItem) -> None:
         self._suspend_capture = True
@@ -1183,13 +1206,31 @@ class HistoryDelegate(QtWidgets.QStyledItemDelegate):
             fill_color = QtGui.QColor(accent_color)
             fill_color.setAlpha(55 if dark_mode else 85)
             border_color = accent_color
-        if is_selected:
-            fill_color = QtGui.QColor(accent_color)
-            fill_color.setAlpha(120 if dark_mode else 160)
-            border_color = accent_color
 
-        painter.setPen(QtGui.QPen(border_color, 1))
-        painter.setBrush(fill_color)
+        # Prepare brush and pen: selected uses gradient border and a strongly darkened gradient fill
+        if is_selected:
+            # Gradient border (full intensity)
+            border_grad = QtGui.QLinearGradient(card_rect.topLeft(), card_rect.bottomRight())
+            border_grad.setColorAt(0.0, QtGui.QColor(accent_color))
+            border_grad.setColorAt(1.0, QtGui.QColor(alt_accent))
+            border_pen = QtGui.QPen(QtGui.QBrush(border_grad), 1.4)
+            border_pen.setCosmetic(True)
+
+            # Strongly darkened gradient fill
+            fill_grad = QtGui.QLinearGradient(card_rect.topLeft(), card_rect.bottomRight())
+            start_c = QtGui.QColor(accent_color).darker(240 if dark_mode else 280)
+            end_c = QtGui.QColor(alt_accent).darker(240 if dark_mode else 280)
+            start_c.setAlpha(200 if dark_mode else 230)
+            end_c.setAlpha(185 if dark_mode else 215)
+            fill_grad.setColorAt(0.0, start_c)
+            fill_grad.setColorAt(1.0, end_c)
+            fill_brush = QtGui.QBrush(fill_grad)
+        else:
+            border_pen = QtGui.QPen(border_color, 1)
+            fill_brush = QtGui.QBrush(fill_color)
+
+        painter.setPen(border_pen)
+        painter.setBrush(fill_brush)
         painter.drawRoundedRect(card_rect, 14, 14)
 
         star_rect = self._star_rect(card_rect)
@@ -1506,6 +1547,195 @@ class HistoryDelegate(QtWidgets.QStyledItemDelegate):
         return pixmap
 
 
+def qr_text_for_item(item: ClipboardItem) -> Optional[str]:
+    """Return a reasonable text representation for QR encoding, or None if unsuitable."""
+    try:
+        if item is None:
+            return None
+        fmt = (item.format or "text").lower()
+        if fmt == "image":
+            # Only use text if present
+            text = (item.content or "").strip()
+            return text or None
+        if fmt == "files" and item.files:
+            return "\n".join(item.files)
+        if fmt == "urls" and item.urls:
+            return "\n".join(item.urls)
+        if fmt == "table":
+            if item.csv_data:
+                try:
+                    raw = base64.b64decode(item.csv_data)
+                    txt = decode_bytes_to_text(raw)
+                    if txt.strip():
+                        return txt
+                except Exception:
+                    pass
+            if item.html:
+                doc = QtGui.QTextDocument()
+                doc.setHtml(item.html)
+                txt = doc.toPlainText()
+                if txt.strip():
+                    return txt
+            return (item.content or "").strip() or None
+        if fmt in ("html", "rich") and item.html:
+            doc = QtGui.QTextDocument()
+            doc.setHtml(item.html)
+            return doc.toPlainText().strip() or (item.content or "").strip() or None
+        # default to text
+        return (item.content or "").strip() or None
+    except Exception:
+        return None
+
+
+class QrCodeDialog(QtWidgets.QDialog):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("QR-Code")
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self._last_png: Optional[bytes] = None
+        self._text: str = ""
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        self._image_label = QtWidgets.QLabel()
+        self._image_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self._image_label, 1)
+
+        self._text_label = QtWidgets.QLabel()
+        self._text_label.setWordWrap(True)
+        self._text_label.setStyleSheet("QLabel { font-size: 11px; color: rgba(154,163,192,200); }")
+        layout.addWidget(self._text_label)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch(1)
+        self._save_btn = QtWidgets.QPushButton("Speichern...")
+        self._close_btn = QtWidgets.QPushButton("Schliessen")
+        buttons.addWidget(self._save_btn)
+        buttons.addWidget(self._close_btn)
+        layout.addLayout(buttons)
+
+        self._save_btn.clicked.connect(self._on_save)
+        self._close_btn.clicked.connect(self.close)
+
+        self.resize(460, 520)
+
+    def set_text(self, text: str) -> None:
+        self._text = text or ""
+        self._text_label.setText(self._text)
+        # Build QR image
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_Q,
+            box_size=8,
+            border=2,
+        )
+        qr.add_data(self._text)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        data = buf.getvalue()
+        self._last_png = data
+        pix = QtGui.QPixmap()
+        pix.loadFromData(data, "PNG")
+        scaled = pix.scaled(420, 420, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        self._image_label.setPixmap(scaled)
+
+    def _on_save(self) -> None:
+        if not self._last_png:
+            return
+        default_name = "qrcode.png"
+        pictures = os.path.expanduser("~/Pictures")
+        start_dir = pictures if os.path.isdir(pictures) else str(Path.home())
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "QR-Code speichern",
+            str(Path(start_dir) / default_name),
+            "PNG-Bild (*.png)"
+        )
+        if path:
+            try:
+                Path(path).write_bytes(self._last_png)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Fehler", f"Konnte Datei nicht speichern:\n{exc}")
+
+
+class EditEntryDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget, initial_text: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Eintrag bearbeiten")
+        self.setModal(True)
+        self._result: Optional[str] = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        self._edit = QtWidgets.QPlainTextEdit()
+        self._edit.setPlainText(initial_text or "")
+        layout.addWidget(self._edit, 1)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel
+        )
+        layout.addWidget(buttons)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+
+    def _accept(self) -> None:
+        self._result = self._edit.toPlainText()
+        self.accept()
+
+    def result_text(self) -> Optional[str]:
+        return self._result
+
+
+class SmoothListWidget(QtWidgets.QListWidget):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._smooth_enabled = True
+        self._anim = QtCore.QPropertyAnimation(self.verticalScrollBar(), b"value", self)
+        self._anim.setDuration(180)
+        self._anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self._target_value: Optional[int] = None
+
+    def setSmoothScrollEnabled(self, enabled: bool) -> None:
+        self._smooth_enabled = bool(enabled)
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        if not self._smooth_enabled:
+            return super().wheelEvent(event)
+        # Only vertical smooth scroll
+        bar = self.verticalScrollBar()
+        if not bar or not bar.isVisible():
+            return super().wheelEvent(event)
+
+        # Determine delta in pixels to move the scrollbar
+        delta_y = 0
+        pd = event.pixelDelta()
+        if not pd.isNull():
+            delta_y = -pd.y()
+        else:
+            ad = event.angleDelta().y()
+            if ad == 0:
+                return super().wheelEvent(event)
+            # map one notch (120) to about 80 px
+            delta_y = int(round(-ad / 120.0 * 80))
+
+        start = bar.value()
+        end = start + delta_y
+        end = max(bar.minimum(), min(bar.maximum(), end))
+
+        # Chain animations smoothly by adjusting target
+        if self._anim.state() == QtCore.QAbstractAnimation.Running:
+            self._anim.stop()
+            start = bar.value()
+        self._anim.setStartValue(start)
+        self._anim.setEndValue(end)
+        self._anim.start()
+        event.accept()
 class HistoryWindow(QtWidgets.QMainWindow):
     itemActivated = QtCore.Signal(ClipboardItem)
 
@@ -1629,7 +1859,7 @@ class HistoryWindow(QtWidgets.QMainWindow):
         list_layout.setContentsMargins(4, 12, 4, 12)
         list_layout.setSpacing(0)
 
-        self._list = QtWidgets.QListWidget()
+        self._list = SmoothListWidget()
         self._list.setUniformItemSizes(False)
         self._list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self._list.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
@@ -1666,6 +1896,9 @@ class HistoryWindow(QtWidgets.QMainWindow):
         self._copy_button.style().polish(self._copy_button)
         actions.addWidget(self._copy_button)
 
+        self._qr_button = QtWidgets.QPushButton("QR-Code")
+        actions.addWidget(self._qr_button)
+
         actions.addStretch(1)
 
         self._settings_button = QtWidgets.QPushButton("Einstellungen")
@@ -1686,6 +1919,7 @@ class HistoryWindow(QtWidgets.QMainWindow):
         self._list_container.setGraphicsEffect(shadow)
 
         self._copy_button.clicked.connect(self._activate_selected)
+        self._qr_button.clicked.connect(self._show_qr_for_selected)
         self._close_button.clicked.connect(self.close)
         self._settings_button.clicked.connect(self._open_settings)
         self._search_box.textChanged.connect(self._on_search_changed)
@@ -1698,6 +1932,8 @@ class HistoryWindow(QtWidgets.QMainWindow):
         self._items_cache: List[ClipboardItem] = history.all_items()
         self._refresh(self._items_cache)
         self._apply_styles()
+
+        self._qr_dialog: Optional[QrCodeDialog] = None
 
     def _apply_styles(self) -> None:
         start = QtGui.QColor(self._settings.accent_start)
@@ -1894,12 +2130,23 @@ class HistoryWindow(QtWidgets.QMainWindow):
         menu = QtWidgets.QMenu(self)
         pin_label = "Anheften" if not entry.pinned else "Loesen"
         pin_action = menu.addAction(pin_label)
+        edit_action = menu.addAction("Bearbeiten...")
+        qr_action = menu.addAction("QR-Code anzeigen")
         delete_action = menu.addAction("Loeschen")
         delete_action.setEnabled(not entry.pinned)
+        # enable/disable
+        editable_formats = {"text", "html", "rich", "urls", "table"}
+        edit_action.setEnabled((entry.format or "text") in editable_formats)
+        qr_action.setEnabled(qr_text_for_item(entry) is not None)
+
         chosen = menu.exec(self._list.mapToGlobal(point))
         if chosen == pin_action:
             self._history.toggle_pin(entry)
             self._apply_current_filter()
+        elif chosen == edit_action and edit_action.isEnabled():
+            self._edit_entry(entry)
+        elif chosen == qr_action and qr_action.isEnabled():
+            self._show_qr_for_entry(entry)
         elif chosen == delete_action and not entry.pinned:
             self._history.remove_entry(entry)
 
@@ -1925,6 +2172,35 @@ class HistoryWindow(QtWidgets.QMainWindow):
             else:
                 self._history.remove_entry(entry)
         self._apply_current_filter()
+
+    def _show_qr_for_selected(self) -> None:
+        selected = self._list.currentItem()
+        if not selected:
+            return
+        entry = selected.data(QtCore.Qt.UserRole)
+        if not isinstance(entry, ClipboardItem):
+            return
+        self._show_qr_for_entry(entry)
+
+    def _show_qr_for_entry(self, entry: ClipboardItem) -> None:
+        text = qr_text_for_item(entry)
+        if not text:
+            QtWidgets.QMessageBox.information(self, "Hinweis", "Dieser Eintrag kann nicht als QR-Code dargestellt werden.")
+            return
+        if self._qr_dialog is None:
+            self._qr_dialog = QrCodeDialog(self)
+        self._qr_dialog.set_text(text)
+        self._qr_dialog.show()
+        self._qr_dialog.raise_()
+
+    def _edit_entry(self, entry: ClipboardItem) -> None:
+        # Use a plain text version for editing
+        base_text = qr_text_for_item(entry) or entry.content or ""
+        dialog = EditEntryDialog(self, base_text)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            new_text = dialog.result_text() or ""
+            self._history.edit_entry(entry, new_text)
+            self._apply_current_filter()
 
 
 class HotkeyEditor(QtWidgets.QLineEdit):
@@ -2153,10 +2429,12 @@ class SettingsDialog(QtWidgets.QDialog):
         self._prev_editor = HotkeyEditor(self._settings.hotkey_prev)
         self._next_editor = HotkeyEditor(self._settings.hotkey_next)
         self._show_editor = HotkeyEditor(self._settings.hotkey_show_history)
+        self._qr_editor = HotkeyEditor(getattr(self._settings, "hotkey_qr", "Alt+Shift+Q"))
 
         hotkey_layout.addRow("Vorheriger Eintrag:", self._prev_editor)
         hotkey_layout.addRow("Naechster Eintrag:", self._next_editor)
         hotkey_layout.addRow("Verlauf öffnen:", self._show_editor)
+        hotkey_layout.addRow("QR-Code anzeigen:", self._qr_editor)
 
         layout.addWidget(hotkey_group)
 
@@ -2233,6 +2511,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self._prev_editor.setSequence(defaults.hotkey_prev)
         self._next_editor.setSequence(defaults.hotkey_next)
         self._show_editor.setSequence(defaults.hotkey_show_history)
+        try:
+            self._qr_editor.setSequence(getattr(defaults, 'hotkey_qr', 'Alt+Shift+Q'))
+        except Exception:
+            pass
         self._preview_checkbox.setChecked(defaults.show_preview_overlay)
         self._capture_checkbox.setChecked(defaults.capture_protection_enabled)
         self._auto_clear_checkbox.setChecked(defaults.auto_clear_enabled)
@@ -2266,6 +2548,7 @@ class SettingsDialog(QtWidgets.QDialog):
                 hotkey_prev=self._prev_editor.sequence(),
                 hotkey_next=self._next_editor.sequence(),
                 hotkey_show_history=self._show_editor.sequence(),
+                hotkey_qr=self._qr_editor.sequence(),
                 show_preview_overlay=self._preview_checkbox.isChecked(),
                 capture_protection_enabled=self._capture_checkbox.isChecked(),
                 theme_mode=self._theme_combo.currentData() or "dark",
@@ -2285,6 +2568,7 @@ class SettingsDialog(QtWidgets.QDialog):
                 new_settings.hotkey_prev,
                 new_settings.hotkey_next,
                 new_settings.hotkey_show_history,
+                getattr(new_settings, 'hotkey_qr', 'Alt+Shift+Q'),
             ):
                 if not seq:
                     raise ValueError("Hotkeys duerfen nicht leer sein.")
@@ -2547,6 +2831,7 @@ class MainController(QtCore.QObject):
     HOTKEY_NEXT = 1001
     HOTKEY_PREV = 1002
     HOTKEY_SHOW = 1003
+    HOTKEY_QR = 1004
 
     def __init__(self, app: QtWidgets.QApplication, settings: AppSettings) -> None:
         super().__init__()
@@ -2596,6 +2881,7 @@ class MainController(QtCore.QObject):
         current = self._clipboard_history.current_item()
         if current and self._settings.show_preview_overlay:
             self._toast.show_preview(current)
+        self._qr_dialog: Optional[QrCodeDialog] = None
 
     def _register_hotkeys(self) -> None:
         self._hotkeys.unregister_all()
@@ -2606,6 +2892,11 @@ class MainController(QtCore.QObject):
                 self.HOTKEY_SHOW,
                 self._settings.hotkey_show_history,
                 DEFAULT_SETTINGS.hotkey_show_history,
+            ),
+            (
+                self.HOTKEY_QR,
+                getattr(self._settings, "hotkey_qr", "Alt+Shift+Q"),
+                getattr(DEFAULT_SETTINGS, "hotkey_qr", "Alt+Shift+Q"),
             ),
         ]
         changed = False
@@ -2618,8 +2909,10 @@ class MainController(QtCore.QObject):
                     self._settings.hotkey_prev = fallback
                 elif hotkey_id == self.HOTKEY_NEXT:
                     self._settings.hotkey_next = fallback
-                else:
+                elif hotkey_id == self.HOTKEY_SHOW:
                     self._settings.hotkey_show_history = fallback
+                elif hotkey_id == self.HOTKEY_QR:
+                    self._settings.hotkey_qr = fallback
                 changed = True
             try:
                 self._hotkeys.register_hotkey(hotkey_id, modifiers, key)
@@ -2634,8 +2927,10 @@ class MainController(QtCore.QObject):
                     self._settings.hotkey_prev = fallback
                 elif hotkey_id == self.HOTKEY_NEXT:
                     self._settings.hotkey_next = fallback
-                else:
+                elif hotkey_id == self.HOTKEY_SHOW:
                     self._settings.hotkey_show_history = fallback
+                elif hotkey_id == self.HOTKEY_QR:
+                    self._settings.hotkey_qr = fallback
                 changed = True
                 self._hotkeys.register_hotkey(hotkey_id, modifiers, key)
         if changed:
@@ -2734,6 +3029,11 @@ class MainController(QtCore.QObject):
         elif hotkey_id == self.HOTKEY_SHOW:
             self._show_history()
             return
+        elif hotkey_id == self.HOTKEY_QR:
+            item = self._clipboard_history.current_item()
+            if item:
+                self._show_qr_for_item(item)
+            return
         else:
             return
 
@@ -2743,6 +3043,18 @@ class MainController(QtCore.QObject):
                 self._toast.show_preview(item)
             else:
                 self._toast.hide()
+
+    def _show_qr_for_item(self, item: ClipboardItem) -> None:
+        text = qr_text_for_item(item)
+        if not text:
+            QtWidgets.QMessageBox.information(None, "Hinweis", "Dieser Eintrag kann nicht als QR-Code dargestellt werden.")
+            return
+        parent = self._history_window if (self._history_window and self._history_window.isVisible()) else self._main_window
+        if self._qr_dialog is None or (parent is not None and self._qr_dialog.parent() is not parent):
+            self._qr_dialog = QrCodeDialog(parent)
+        self._qr_dialog.set_text(text)
+        self._qr_dialog.show()
+        self._qr_dialog.raise_()
 
     def _on_selection_change(self, item: Optional[ClipboardItem]) -> None:
         if item and self._settings.show_preview_overlay:
@@ -2937,6 +3249,7 @@ class MainWindow(QtWidgets.QWidget):
         lines = [
             f"\u2022 {display_hotkey(settings.hotkey_prev)} / {display_hotkey(settings.hotkey_next)}: Verlauf wechseln",
             f"\u2022 {display_hotkey(settings.hotkey_show_history)}: Verlauf oeffnen",
+            f"\u2022 {display_hotkey(getattr(settings, 'hotkey_qr', 'Alt+Shift+Q'))}: QR-Code anzeigen",
             f"\u2022 Vorschau-Overlay: {preview_state}",
             f"\u2022 Aufnahmeschutz: {capture_state}",
             "\u2022 Enter in der Liste: Auswahl uebernehmen",

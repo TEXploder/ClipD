@@ -18,4 +18,11 @@ hiddenimports = [
     "PySide6.QtGui",
     "PySide6.QtWidgets",
     "cryptography.fernet",
+    # QR code support and backend
+    "qrcode",
+    "qrcode.image",
+    "qrcode.image.pil",
+    "PIL",
+    "PIL.Image",
+    "PIL.PngImagePlugin",
 ]
